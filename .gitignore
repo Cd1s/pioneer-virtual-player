@@ -6,3 +6,7 @@ artifacts/*.ecdsa
 artifacts/*authorized_keys*
 artifacts/*.zip
 __pycache__/
+
+artifacts/squashfs-root/
+artifacts/*
+!artifacts/.gitkeep
