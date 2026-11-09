@@ -1,0 +1,8 @@
+artifacts/*.UPD
+artifacts/*.UPD.root
+artifacts/*.AppImage
+artifacts/*.tar.gz
+artifacts/*.ecdsa
+artifacts/*authorized_keys*
+artifacts/*.zip
+__pycache__/
