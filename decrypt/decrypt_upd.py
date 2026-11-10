@@ -1,56 +1,93 @@
 #!/usr/bin/env python3
 """Decrypt a Pioneer LUKS1 .UPD to its ISO payload, given the 32-byte key.
 
-First verifies the key against the header's mk_digest (same logic as
-luks_slot_test.py), then XTS-decrypts the whole payload and writes the ISO.
+The key is checked by cryptsetup's own LUKS1 keyslot code, then the payload
+is read from the mapped device.  Using cryptsetup for both steps means the
+container is decrypted by the same implementation that built the reference
+containers in ``luks_slot_test.py --selftest`` -- there is no second,
+home-grown XTS/anti-forensic path that could disagree with it.
 
 Usage:
   python3 decrypt_upd.py <file.upd> <keyfile-or-hex> -o <out.iso>
 """
-import argparse, struct, sys
-sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
-from luks_slot_test import (parse_pioneer_luks1, pbkdf2_sha256,
-                            xts_decrypt_block, af_merge, read_key, gf_mul_le)
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 
-def derive_master(data, s, keyfile):
-    slot_key = pbkdf2_sha256(keyfile, s["salt"], s["iters"], 64)
-    dk, tk = slot_key[:32], slot_key[32:]
-    km = data[s["kmoff"]*512:(s["kmoff"]*512) + 64*s["stripes"]]
-    stripes = [xts_decrypt_block(km[i*64:(i+1)*64], dk, tk, i) for i in range(s["stripes"])]
-    return af_merge(stripes)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from luks_slot_test import parse_pioneer_luks1, read_key  # noqa: E402
 
-def decrypt(data, master, out_path):
-    hd = parse_pioneer_luks1(data)
-    dk, tk = master[:32], master[32:]
-    poff = hd["poff"]                     # first payload sector
-    payload = data[poff*512:]
-    nsec = len(payload)//512
-    out = bytearray(nsec*512)
-    for i in range(nsec):
-        sec = payload[i*512:(i+1)*512]
-        out[i*512:(i+1)*512] = xts_decrypt_block(sec, dk, tk, i)
-    with open(out_path, "wb") as f:
-        f.write(bytes(out))
-    return nsec
+def iso_volume_bytes(path: str) -> int | None:
+    """Size of the ISO 9660 volume, or None when there is no PVD."""
+    with open(path, "rb") as fh:
+        fh.seek(0x8000)
+        pvd = fh.read(2048)
+    if len(pvd) < 88 or pvd[0] != 1 or pvd[1:6] != b"CD001":
+        return None
+    return int.from_bytes(pvd[80:84], "little") * 2048
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("upd"); ap.add_argument("key"); ap.add_argument("-o", "--out", required=True)
-    a = ap.parse_args()
-    data = open(a.upd, "rb").read()
-    hd = parse_pioneer_luks1(data)
-    kb = read_key(a.key)
-    active = [s for s in hd["slots"] if s["active"]]
-    if not active:
-        raise SystemExit("no active slot")
-    master = derive_master(data, active[0], kb)
-    check = pbkdf2_sha256(master, hd["mk_salt"], hd["mk_iter"], 20)
-    if check != hd["mk_digest"]:
-        raise SystemExit("key does NOT match this .UPD's mk_digest (wrong key or wrong file)")
-    n = decrypt(data, master, a.out)
-    print(f"OK: key verified, decrypted {n} sectors -> {a.out}")
-    print("next: this is an ISO 9660 image. Mount it (or 7z/isoinfo) and take "
-          "images/, the kernel, rootfs and the ep122 UI binary + assets.")
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("upd")
+    parser.add_argument("key")
+    parser.add_argument("-o", "--out", required=True)
+    args = parser.parse_args()
+
+    if not shutil.which("cryptsetup"):
+        raise SystemExit("cryptsetup is required (system package 'cryptsetup')")
+
+    head = open(args.upd, "rb").read(592)
+    header = parse_pioneer_luks1(head)
+    active = [i for i, s in enumerate(header["slots"]) if s["active"]]
+    print(f"{args.upd}: LUKS1, payload at sector {header['poff']}, "
+          f"{header['kbytes'] * 8}-bit key, active slots {active}")
+
+    key = read_key(args.key)
+    with tempfile.NamedTemporaryFile(delete=False) as fh:
+        fh.write(key)
+        keyfile = fh.name
+    name = "pvp-" + str(os.getpid())
+    try:
+        open_proc = subprocess.run(
+            ["cryptsetup", "open", "--readonly", "--type", "luks1",
+             "--key-file", keyfile, args.upd, name],
+            capture_output=True, text=True)
+        if open_proc.returncode != 0:
+            raise SystemExit("key does NOT open this .UPD "
+                             "(wrong key or wrong file):\n" + open_proc.stderr.strip())
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        subprocess.run(["dd", f"if=/dev/mapper/{name}", f"of={args.out}",
+                        "bs=4M", "status=none"], check=True)
+    finally:
+        subprocess.run(["cryptsetup", "close", name], check=False,
+                       capture_output=True)
+        os.unlink(keyfile)
+
+    size = os.path.getsize(args.out)
+    volume = iso_volume_bytes(args.out)
+    if volume and 0 < volume <= size:
+        if volume < size:
+            # The .UPD carries an unencrypted trailer (product tag + CRC32)
+            # past the payload; cryptsetup exposes it as extra sectors.
+            with open(args.out, "r+b") as fh:
+                fh.truncate(volume)
+            size = volume
+        print(f"OK: key verified, decrypted ISO 9660 volume, {size} bytes "
+              f"-> {args.out}")
+        print("mount it (or use 7z/iso9660fs) and take the kernel, rootfs, "
+              "images/ and the ep122 UI assets.")
+    else:
+        print(f"OK: key verified, decrypted {size} bytes -> {args.out}")
+        print("note: no ISO 9660 PVD at sector 16; the payload is still "
+              "plaintext, inspect it before mounting.")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

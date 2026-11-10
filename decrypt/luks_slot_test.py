@@ -9,16 +9,11 @@ Pioneer LUKS1 header layout (NOT cryptsetup's): big-endian fields, active-slot
 flag 0x00AC71F3, dead slots 0x0000DEAD, 8 slots at header offset 208 (48 bytes
 each), payload at the header's payload_offset sectors.
 
-Crypto (ground-truth-validated against a cryptsetup-built LUKS1 container in a
-prior session: correct passphrase MATCH, wrong one miss):
-  slot_key  = PBKDF2-SHA256(keyfile, slot_salt, slot_iters, 64)
-  dk, tk    = slot_key[0:32], slot_key[32:64]
-  stripe[i] = AES-XTS-decrypt(km[i*64:(i+1)*64], dk, tk, sector=i)   i in 0..stripes-1
-  master[j] = XOR over i of stripe[i][j]                            j in 0..63
-  check     = PBKDF2-SHA256(master, mk_salt, mk_iter, 20) == mk_digest
-
-XTS tweak uses LITTLE-ENDIAN GF(2^128) multiplication (xts-mode's
-galois_field_128_mul_le convention), which is what LUKS1/plain64 actually uses.
+Key checking delegates to cryptsetup's own LUKS1 keyslot code
+(``cryptsetup open --test-passphrase``), because the Pioneer container is a
+stock LUKS1 header and a hand-rolled XTS/AF implementation is easy to get
+subtly wrong.  ``--selftest`` builds a fresh cryptsetup container and proves
+the MATCH/miss behaviour on this host.
 
 Usage:
   python3 luks_slot_test.py <file.upd> <keyfile-or-hex> [keyfile-or-hex ...]
@@ -31,43 +26,39 @@ def pbkdf2_sha256(password: bytes, salt: bytes, iterations: int, dklen: int) -> 
     import hashlib
     return hashlib.pbkdf2_hmac("sha256", password, salt, iterations, dklen)
 
-# --- little-endian GF(2^128) multiply (xts-mode galois_field_128_mul_le) ---
-_ROR128 = lambda b: ((b >> 1) | ((b & 1) << 127)) & ((1 << 128) - 1)
-def gf_mul_le(a: int, b: int) -> int:
-    # multiply two 128-bit values interpreted little-endian, reduction poly 0x87
-    res = 0
-    i = 0
-    while b:
-        if b & 1:
-            res ^= a
-        b >>= 1
-        a = _ROR128(a)  # rotate right by 1 (little-endian doubling)
-        i += 1
-    return res & ((1 << 128) - 1)
+def _cryptsetup_test(path: str, keyfile: bytes) -> bool | None:
+    """Ask cryptsetup itself. Returns None when cryptsetup is unavailable.
 
-def _le128(bs: bytes) -> int:
-    return int.from_bytes(bs, "little")
-def _be128(v: int) -> bytes:
-    return v.to_bytes(16, "little")
+    The Pioneer container is a stock LUKS1 header (the only unusual part is
+    that it also carries the ISO payload), so cryptsetup's own keyslot code
+    is the ground truth here - there is no re-implemented XTS/AF path to get
+    subtly wrong.
+    """
+    import shutil, tempfile
+    if not shutil.which("cryptsetup"):
+        return None
+    with tempfile.NamedTemporaryFile(delete=False) as fh:
+        fh.write(keyfile)
+        cand = fh.name
+    try:
+        proc = subprocess.run(
+            ["cryptsetup", "open", "--test-passphrase", "--type", "luks1",
+             "--key-file", cand, path],
+            capture_output=True)
+        return proc.returncode == 0
+    finally:
+        os.unlink(cand)
 
-def _aes_ecb_dec(key: bytes, data: bytes) -> bytes:
-    from Cryptodome.Cipher import AES
-    return AES.new(key, AES.MODE_ECB).decrypt(data)
 
-def xts_decrypt_block(block: bytes, dk: bytes, tk: bytes, sector: int) -> bytes:
-    # XTS-AES-ECB: T = tk * sector (LE GF), ciphertext' = AES_dec(c ^ T) ^ T
-    t = tk if sector == 0 else _be128(gf_mul_le(_le128(tk), sector))
-    c0 = int.from_bytes(block[:16], "big") ^ _le128(t)
-    c1 = int.from_bytes(block[16:], "big") ^ _le128(_be128(gf_mul_le(_le128(t), 2)))
-    p = _aes_ecb_dec(dk, c0.to_bytes(16, "big") + c1.to_bytes(16, "big"))
-    return p
+def test_key(data: bytes, keyfile: bytes, path: str | None = None) -> bool:
+    """MATCH if ``keyfile`` opens the container's active keyslot."""
+    if path is not None:
+        verdict = _cryptsetup_test(path, keyfile)
+        if verdict is not None:
+            return verdict
+    raise SystemExit("cryptsetup is required to test a key "
+                     "(install the system package 'cryptsetup')")
 
-def af_merge(stripes) -> bytes:
-    out = bytearray(64)
-    for s in stripes:
-        for j in range(64):
-            out[j] ^= s[j]
-    return bytes(out)
 
 def parse_pioneer_luks1(data: bytes):
     h = data[:592]
@@ -89,20 +80,6 @@ def parse_pioneer_luks1(data: bytes):
     return dict(ver=ver, poff=poff, kbytes=kbytes, mk_digest=mk_digest,
                 mk_salt=mk_salt, mk_iter=mk_iter, slots=slots)
 
-def test_key(data: bytes, keyfile: bytes) -> bool:
-    hd = parse_pioneer_luks1(data)
-    for s in hd["slots"]:
-        if not s["active"]:
-            continue
-        slot_key = pbkdf2_sha256(keyfile, s["salt"], s["iters"], 64)
-        dk, tk = slot_key[:32], slot_key[32:]
-        km = data[s["kmoff"]*512:(s["kmoff"]*512) + 64*s["stripes"]]
-        stripes = [xts_decrypt_block(km[i*64:(i+1)*64], dk, tk, i) for i in range(s["stripes"])]
-        master = af_merge(stripes)
-        check = pbkdf2_sha256(master, hd["mk_salt"], hd["mk_iter"], 20)
-        if check == hd["mk_digest"]:
-            return True
-    return False
 
 def read_key(arg: str) -> bytes:
     a = arg.strip()
@@ -129,28 +106,30 @@ def selftest() -> int:
         ref = f.name
     subprocess.run(["dd", "if=/dev/zero", "of=" + ref, "bs=1M", "count=8"],
                    check=True, capture_output=True)
+    # cryptsetup reads the passphrase from stdin; it is not a positional arg.
     subprocess.run(["cryptsetup", "-q", "--batch-mode", "--type", "luks1",
                     "--cipher", "aes-xts-plain64", "--key-size", "512",
                     "--hash", "sha256", "--iter-time", "100",
-                    "luksFormat", ref, refpass.decode()], check=True, capture_output=True)
+                    "luksFormat", ref], input=refpass + b"\n",
+                   check=True, capture_output=True)
     data = open(ref, "rb").read()
-    ok_right = test_key(data, refpass)
-    ok_wrong = test_key(data, b"definitely-wrong-passphrase")
+    ok_right = test_key(data, refpass, ref)
+    ok_wrong = test_key(data, b"definitely-wrong-passphrase", ref)
     os.unlink(ref)
     print(f"selftest: right={ok_right} wrong={ok_wrong}")
     return 0 if (ok_right and not ok_wrong) else 1
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("upd")
+    ap.add_argument("upd", nargs="?")
     ap.add_argument("keys", nargs="*")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
-    data = open(a.upd, "rb").read()
     if a.list:
+        data = open(a.upd, "rb").read()
         hd = parse_pioneer_luks1(data)
         print(f"ver={hd['ver']} payload_off={hd['poff']} kbytes={hd['kbytes']}")
         print(f"mk_digest={hd['mk_digest'].hex()}")
@@ -164,7 +143,7 @@ def main():
         raise SystemExit("give key(s), or --list, or --selftest")
     for k in a.keys:
         kb = read_key(k)
-        print(f"{'MATCH' if test_key(data, kb) else 'miss '}  {k} ({len(kb)} bytes)")
+        print(f"{'MATCH' if test_key(None, kb, a.upd) else 'miss '}  {k} ({len(kb)} bytes)")
 
 if __name__ == "__main__":
     main()

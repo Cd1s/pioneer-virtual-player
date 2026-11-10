@@ -49,12 +49,27 @@ Pioneer LUKS1 header: big-endian fields, active-slot flag `0x00AC71F3`, dead slo
 
 ```
 README.md                    this overview
+selftest.sh                  prove the key tester + USB writer without a deck
 firmware-recovery/README.md  recover the container key from user-owned hardware
 decrypt/luks_slot_test.py    verified container-key tester (MATCH/miss, --selftest)
 decrypt/decrypt_upd.py       recovered key -> full factory ISO
 fuzz/prolink_fuzz.py         ProLink edge-case input runner (network)
-fuzz/make_usb.py             edge-case rekordbox library builder (media)
+fuzz/make_usb.py             rekordbox USB export builder (media)
+fuzz/pioneer_usb.py          DeviceSQL + ANLZ writer, and an independent reader
+fuzz/pdb_verify.py           re-parses the export and checks its invariants
+fuzz/README.md               the on-media format, and the traps in it
 emulate/README.md            cdj3k-emu faithful virtual player
 service-access/README.md     cdj3k-root service access (standalone CDJ-3000 only)
 artifacts/                   official .UPD containers + community binaries
 ```
+
+## Verifying without hardware
+
+```sh
+./selftest.sh          # LUKS1 tester, then build + verify a 34-track export
+```
+
+The USB writer is checked by an independent parser, and that parser is in turn
+checked against a genuine rekordbox 7 `export.pdb` (see `fuzz/README.md`), so
+the structural claims are testable offline. A deck is still the final word on
+whether a given firmware accepts a given edge case.
